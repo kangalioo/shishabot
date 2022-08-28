@@ -1,35 +1,29 @@
-use std::collections::hash_map::Entry;
-
-use crate::checks::PERMISSIONS_CHECK;
-use crate::{server_settings::Server, ServerSettings};
+use crate::{server_settings::Server, PoiseContext};
 use anyhow::{Context, Error};
 use serenity::builder::ParseValue;
+use serenity::model::id::ChannelId;
 use serenity::utils::Color;
-use serenity::{
-    client::Context as SerenityContext,
-    framework::standard::{macros::command, CommandResult},
-    model::{channel::Message, id::ChannelId},
-};
 
-#[command]
-#[checks(Permissions)]
-#[only_in(guilds)]
-#[description = "Setup the input and output channels for your server"]
-#[usage = "[input-channel] [output-channel]"]
-#[example = "#channel-1 #channel-2"]
-async fn setup(ctx: &SerenityContext, msg: &Message) -> CommandResult {
-    let mut mentioned_channels = msg
-        .content
-        .split_whitespace()
-        .filter_map(|arg| arg.parse::<ChannelId>().ok());
-
-    let mut data = ctx.data.write().await;
-    let settings = data.get_mut::<ServerSettings>().unwrap();
-
-    if let (Some(id1), Some(id2)) = (mentioned_channels.next(), mentioned_channels.next()) {
-        let guild_id = msg.guild_id.unwrap_or_default();
+/// Setup the input and output channels for your server
+///
+/// Usage `setup [input-channel] [output-channel]`
+/// Example: `setup #channel-1 #channel-2`
+#[poise::command(
+    prefix_command,
+    slash_command,
+    required_permissions = "MANAGE_CHANNELS",
+    guild_only
+)]
+pub async fn setup(
+    ctx: PoiseContext<'_>,
+    #[description = "Input channel"] id1: Option<ChannelId>,
+    #[description = "Output channel"] id2: Option<ChannelId>,
+) -> Result<(), Error> {
+    if let (Some(id1), Some(id2)) = (id1, id2) {
+        let guild_id = ctx.guild_id().unwrap_or_default();
 
         let edited_settings = {
+            let mut settings = ctx.data().settings.lock().unwrap();
             settings
                 .servers
                 .entry(guild_id)
@@ -43,7 +37,7 @@ async fn setup(ctx: &SerenityContext, msg: &Message) -> CommandResult {
                     prefixes: Vec::new(),
                 });
 
-            serde_json::to_string(settings).context("failed to serialize server settings")?
+            serde_json::to_string(&*settings).context("failed to serialize server settings")?
         };
 
         if let Err(why) = tokio::fs::write("src/server_settings.json", edited_settings).await {
@@ -51,44 +45,47 @@ async fn setup(ctx: &SerenityContext, msg: &Message) -> CommandResult {
             warn!("{err:?}");
         }
 
-        msg.reply(&ctx, "Successfully changed settings!").await?;
-    } else if let Entry::Occupied(o) = settings.servers.entry(msg.guild_id.unwrap_or_default()) {
-        if o.get().output_channel != 0 {
-            msg.channel_id
-                .send_message(&ctx, |m| {
-                    m.reference_message((msg.channel_id, msg.id))
-                        .allowed_mentions(|f| {
-                            f.replied_user(false)
-                                .parse(ParseValue::Everyone)
-                                .parse(ParseValue::Users)
-                                .parse(ParseValue::Roles)
-                        });
-                    m.embed(|e| {
-                        e.title(format!(
-                            "Current channel setup{}",
-                            if let Some(guild) = msg.guild_id {
-                                format!(" for {}", guild.name(&ctx).unwrap_or_default())
-                            } else {
-                                String::new()
-                            }
-                        ))
-                        .description(format!(
-                            "**Input Channel:** <#{}>\n**Output Channel:** <#{}>",
-                            o.get().input_channel,
-                            o.get().output_channel
-                        ))
-                        .footer(|f| {
-                            {
-                                f.text("Use !!setup [input-channel] [output-channel] to edit this")
-                            }
-                        })
-                        .color(Color::new(15785176))
-                    })
+        ctx.say("Successfully changed settings!").await?;
+    } else if let Some(o) = {
+        let settings = ctx.data().settings.lock().unwrap();
+        let o = settings
+            .servers
+            .get(&ctx.guild_id().unwrap_or_default())
+            .cloned();
+        o
+    } {
+        if o.output_channel != 0 {
+            ctx.send(|m| {
+                if let PoiseContext::Prefix(ctx) = ctx {
+                    m.reference_message((ctx.msg.channel_id, ctx.msg.id));
+                }
+                m.allowed_mentions(|f| {
+                    f.replied_user(false)
+                        .parse(ParseValue::Everyone)
+                        .parse(ParseValue::Users)
+                        .parse(ParseValue::Roles)
+                });
+                m.embed(|e| {
+                    e.title(format!(
+                        "Current channel setup{}",
+                        if let Some(guild) = ctx.guild_id() {
+                            format!(" for {}", guild.name(ctx.discord()).unwrap_or_default())
+                        } else {
+                            String::new()
+                        }
+                    ))
+                    .description(format!(
+                        "**Input Channel:** <#{}>\n**Output Channel:** <#{}>",
+                        o.input_channel, o.output_channel
+                    ))
+                    .footer(|f| f.text("Use !!setup [input-channel] [output-channel] to edit this"))
+                    .color(Color::new(15785176))
                 })
-                .await?;
+            })
+            .await?;
         }
     } else {
-        msg.reply(&ctx, "You need to mention 2 channels!").await?;
+        ctx.say("You need to mention 2 channels!").await?;
     }
 
     Ok(())

@@ -1,3 +1,5 @@
+#![allow(dead_code)] // temporary
+
 mod ping;
 pub use ping::*;
 

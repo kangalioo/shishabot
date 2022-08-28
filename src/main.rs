@@ -7,26 +7,16 @@ extern crate log;
 use std::{
     env,
     fs::{self, File},
-    future::Future,
     io::Write,
     iter,
     path::{Path, PathBuf},
-    pin::Pin,
     sync::Arc,
 };
 
-use anyhow::{Error, Result};
+use anyhow::{Context as _, Error, Result};
 use replay_queue::ReplayQueue;
 use rosu_v2::Osu;
-use serenity::{
-    async_trait,
-    framework::standard::{
-        macros::{group, hook},
-        CommandResult, DispatchError, Reason, StandardFramework,
-    },
-    model::prelude::*,
-    prelude::*,
-};
+use serenity::{framework::standard::macros::hook, model::prelude::*, prelude::*};
 
 mod checks;
 mod commands;
@@ -38,6 +28,13 @@ mod util;
 
 use commands::*;
 use process_replays::*;
+
+#[derive(Debug)]
+pub struct Data {
+    settings: std::sync::Mutex<server_settings::Root>,
+}
+
+type PoiseContext<'a> = poise::Context<'a, Data, Error>;
 
 const DEFAULT_PREFIX: &str = "!!";
 
@@ -51,79 +48,86 @@ impl TypeMapKey for ServerSettings {
     type Value = server_settings::Root;
 }
 
-struct Handler;
-#[async_trait]
-impl EventHandler for Handler {
-    async fn ready(&self, ctx: Context, ready: Ready) {
-        info!("{} is connected!", ready.user.name);
-        ctx.set_activity(Activity::playing(format!(
-            "in {} servers | !!help",
-            ctx.cache.guilds().len()
-        )))
-        .await;
-    }
-
-    async fn message(&self, ctx: Context, msg: Message) {
-        if msg.content.contains("start") || msg.content.contains("end") {
-            return;
-        }
-
-        match parse_attachment_replay(&msg, &ctx.data, None).await {
-            Ok(AttachmentParseSuccess::NothingToDo) => {}
-            Ok(AttachmentParseSuccess::BeingProcessed) => {
-                let reaction = ReactionType::Unicode("✅".to_string());
-                if let Err(why) = msg.react(&ctx, reaction).await {
-                    let err =
-                        Error::new(why).context("failed to react after attachment parse success");
-                    warn!("{:?}", err);
-                }
-            }
-            Err(AttachmentParseError::IncorrectMode(_)) => {
-                if let Err(why) = msg.reply(&ctx, "danser only accepts osu!standard plays, sorry :(").await {
-                    let err =
-                        Error::new(why).context("failed to reply after attachment parse error");
-                    warn!("{:?}", err);
-                }
-            }
-            Err(why) => {
-                let err = Error::new(why).context("failed to parse attachment");
-                warn!("{:?}", err);
-                
-                if let Err(why) = msg.reply(&ctx, "something went wrong, blame mezo").await {
-                    let err =
-                        Error::new(why).context("failed to reply after attachment parse error");
-                    warn!("{:?}", err);
-                }
-            }
-        }
-    }
-
-    async fn guild_create(&self, ctx: Context, _: Guild, is_new: bool) {
-        if is_new {
+#[hook]
+async fn event_listener(
+    ctx: &Context,
+    event: &poise::Event<'_>,
+    _: poise::FrameworkContext<'_, Data, Error>,
+    _: &Data,
+) -> Result<(), Error> {
+    match event {
+        poise::Event::Ready { data_about_bot } => {
+            info!("{} is connected!", data_about_bot.user.name);
             ctx.set_activity(Activity::playing(format!(
                 "in {} servers | !!help",
                 ctx.cache.guilds().len()
             )))
             .await;
         }
+        poise::Event::Message { new_message: msg } => {
+            if msg.content.contains("start") || msg.content.contains("end") {
+                return Ok(());
+            }
+
+            match parse_attachment_replay(&msg, &ctx.data, None).await {
+                Ok(AttachmentParseSuccess::NothingToDo) => {}
+                Ok(AttachmentParseSuccess::BeingProcessed) => {
+                    let reaction = ReactionType::Unicode("✅".to_string());
+                    if let Err(why) = msg.react(&ctx, reaction).await {
+                        let err = Error::new(why)
+                            .context("failed to react after attachment parse success");
+                        warn!("{:?}", err);
+                    }
+                }
+                Err(AttachmentParseError::IncorrectMode(_)) => {
+                    if let Err(why) = msg
+                        .reply(&ctx, "danser only accepts osu!standard plays, sorry :(")
+                        .await
+                    {
+                        let err =
+                            Error::new(why).context("failed to reply after attachment parse error");
+                        warn!("{:?}", err);
+                    }
+                }
+                Err(why) => {
+                    let err = Error::new(why).context("failed to parse attachment");
+                    warn!("{:?}", err);
+
+                    if let Err(why) = msg.reply(&ctx, "something went wrong, blame mezo").await {
+                        let err =
+                            Error::new(why).context("failed to reply after attachment parse error");
+                        warn!("{:?}", err);
+                    }
+                }
+            }
+        }
+        poise::Event::GuildCreate { is_new, .. } => {
+            if *is_new {
+                ctx.set_activity(Activity::playing(format!(
+                    "in {} servers | !!help",
+                    ctx.cache.guilds().len()
+                )))
+                .await;
+            }
+        }
+        poise::Event::GuildDelete { .. } => {
+            ctx.set_activity(Activity::playing(format!(
+                "in {} servers | !!help",
+                ctx.cache.guilds().len()
+            )))
+            .await;
+        }
+        _ => {}
     }
 
-    async fn guild_delete(&self, ctx: Context, _: UnavailableGuild, _: Option<Guild>) {
-        ctx.set_activity(Activity::playing(format!(
-            "in {} servers | !!help",
-            ctx.cache.guilds().len()
-        )))
-        .await;
-    }
+    Ok(())
 }
 
-#[group]
-#[commands(ping, prefix)]
-struct General;
-
-#[group]
-#[commands(settings, skinlist, addskin, setup, queue, start, end)]
-struct Danser;
+#[poise::command(prefix_command)]
+async fn register(ctx: PoiseContext<'_>) -> Result<(), Error> {
+    poise::builtins::register_application_commands_buttons(ctx).await?;
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() {
@@ -145,30 +149,36 @@ async fn main() {
     let client_secret: String =
         env::var("CLIENT_SECRET").expect("Expected client secret from the env");
 
-    let framework = StandardFramework::new()
-        .configure(|c| {
-            c.with_whitespace(true)
-                .prefix("")
-                .dynamic_prefix(dynamic_prefix)
+    let framework = poise::Framework::builder()
+        .token(token)
+        .options(poise::FrameworkOptions {
+            prefix_options: poise::PrefixFrameworkOptions {
+                // stripped_dynamic_prefix: Some(|a, b, c| Box::pin(dynamic_prefix(a, b, c))),
+                stripped_dynamic_prefix: Some(dynamic_prefix),
+                ..Default::default()
+            },
+            pre_command: log_command,
+            post_command: finished_command,
+            on_error: dispatch_error,
+            listener: event_listener,
+            commands: vec![setup(), register()],
+            ..Default::default()
         })
-        .before(log_command)
-        .after(finished_command)
-        .on_dispatch_error(dispatch_error)
-        .group(&GENERAL_GROUP)
-        .group(&DANSER_GROUP)
-        .help(&HELP);
-
-    let client_fut = Client::builder(&token, GatewayIntents::all())
-        .event_handler(Handler)
-        .framework(framework);
-
-    let mut client = match client_fut.await {
-        Ok(client) => client,
-        Err(why) => panic!(
-            "{:?}",
-            Error::new(why).context("failed to create discord client")
-        ),
-    };
+        .intents(GatewayIntents::all())
+        .user_data_setup(|_, _, _| {
+            Box::pin(async move {
+                let settings_content = tokio::fs::read_to_string("src/server_settings.json")
+                    .await
+                    .context("failed to read `src/server_settings.json`")?;
+                Ok(Data {
+                    settings: serde_json::from_str(&settings_content)
+                        .context("failed to deserialize server settings")?,
+                })
+            })
+        })
+        .build()
+        .await
+        .unwrap();
 
     let osu: Osu = match Osu::new(client_id, client_secret).await {
         Ok(client) => client,
@@ -186,23 +196,7 @@ async fn main() {
         ),
     };
 
-    let settings_content = match tokio::fs::read_to_string("src/server_settings.json").await {
-        Ok(content) => content,
-        Err(why) => panic!(
-            "{:?}",
-            Error::new(why).context("failed to read `src/server_settings.json`")
-        ),
-    };
-
-    let settings = match serde_json::from_str(&settings_content) {
-        Ok(settings) => settings,
-        Err(why) => panic!(
-            "{:?}",
-            Error::new(why).context("failed to deserialize server settings")
-        ),
-    };
-
-    let http = Arc::clone(&client.cache_and_http.http);
+    let http = Arc::clone(&framework.client().cache_and_http.http);
     let queue = Arc::new(ReplayQueue::new());
     tokio::spawn(process_replay(
         osu,
@@ -210,13 +204,8 @@ async fn main() {
         reqwest_client,
         Arc::clone(&queue),
     ));
-    {
-        let mut data = client.data.write().await;
-        data.insert::<ReplayHandler>(queue);
-        data.insert::<ServerSettings>(settings);
-    }
 
-    if let Err(why) = client.start().await {
+    if let Err(why) = framework.start().await {
         error!("{:?}", Error::new(why).context("critical client error"));
     }
 
@@ -247,74 +236,79 @@ async fn create_missing_folders_and_files() -> Result<()> {
 }
 
 #[hook]
-async fn log_command(_: &Context, msg: &Message, cmd_name: &str) -> bool {
-    info!("Got command '{}' by user '{}'", cmd_name, msg.author.name);
-
-    true
+async fn log_command(ctx: PoiseContext<'fut>) {
+    info!(
+        "Got command '{}' by user '{}'",
+        ctx.command().name,
+        ctx.author().name
+    );
 }
 
 #[hook]
-async fn finished_command(_: &Context, _: &Message, cmd_name: &str, cmd_result: CommandResult) {
-    match cmd_result {
-        Ok(_) => info!("Processed command '{}'", cmd_name),
-        Err(why) => {
-            warn!("Command '{}' returned error: {}", cmd_name, why);
-            let mut e = &*why as &dyn std::error::Error;
+async fn finished_command(ctx: PoiseContext<'fut>) {
+    info!("Processed command '{}'", ctx.command().name);
+}
+
+#[hook]
+async fn dynamic_prefix(
+    ctx: &'fut Context,
+    msg: &'fut Message,
+    _: &'fut Data,
+) -> Result<Option<(&'fut str, &'fut str)>, Error> {
+    let prefix = if let Some(ref guild_id) = msg.guild_id {
+        let data = ctx.data.read().await;
+        let settings = data.get::<ServerSettings>().unwrap();
+
+        let prefix = settings
+            .servers
+            .get(guild_id)
+            .and_then(|server| {
+                server
+                    .prefixes
+                    .iter()
+                    .map(String::as_str)
+                    .chain(iter::once(DEFAULT_PREFIX))
+                    .fold(None, |longest, prefix| {
+                        if !msg.content.starts_with(prefix)
+                            || longest
+                                .map(|longest: &str| prefix.len() <= longest.len())
+                                .is_some()
+                        {
+                            longest
+                        } else {
+                            Some(prefix)
+                        }
+                    })
+            })
+            .unwrap_or(DEFAULT_PREFIX);
+
+        prefix.to_owned()
+    } else {
+        DEFAULT_PREFIX.to_owned()
+    };
+
+    Ok(msg
+        .content
+        .strip_prefix(&prefix)
+        .map(|rest| (&msg.content[..prefix.len()], rest)))
+}
+
+#[hook]
+async fn dispatch_error(error: poise::FrameworkError<'fut, Data, Error>) {
+    match error {
+        poise::FrameworkError::CommandCheckFailed { error, .. } => {
+            if let Some(error) = error {
+                info!("Check failed: {error}");
+            }
+        }
+        poise::FrameworkError::Command { ctx, error } => {
+            warn!("Command '{}' returned error: {}", ctx.command().name, error);
+            let mut e = &*error as &dyn std::error::Error;
 
             while let Some(src) = e.source() {
                 warn!("  - caused by: {}", src);
                 e = src;
             }
-        }
-    }
-}
-
-fn dynamic_prefix<'fut>(
-    ctx: &'fut Context,
-    msg: &'fut Message,
-) -> Pin<Box<(dyn Future<Output = Option<String>> + Send + 'fut)>> {
-    let fut = async move {
-        if let Some(ref guild_id) = msg.guild_id {
-            let data = ctx.data.read().await;
-            let settings = data.get::<ServerSettings>().unwrap();
-
-            let prefix = settings
-                .servers
-                .get(guild_id)
-                .and_then(|server| {
-                    server
-                        .prefixes
-                        .iter()
-                        .map(String::as_str)
-                        .chain(iter::once(DEFAULT_PREFIX))
-                        .fold(None, |longest, prefix| {
-                            if !msg.content.starts_with(prefix)
-                                || longest
-                                    .map(|longest: &str| prefix.len() <= longest.len())
-                                    .is_some()
-                            {
-                                longest
-                            } else {
-                                Some(prefix)
-                            }
-                        })
-                })
-                .unwrap_or(DEFAULT_PREFIX);
-
-            Some(prefix.to_owned())
-        } else {
-            Some(DEFAULT_PREFIX.to_owned())
-        }
-    };
-
-    Box::pin(fut)
-}
-
-#[hook]
-async fn dispatch_error(_ctx: &Context, _msg: &Message, error: DispatchError, _command_name: &str) {
-    match error {
-        DispatchError::CheckFailed(name, Reason::Log(reason)) => {
-            info!("Check {name} failed: {reason}")
         }
         _ => info!("Other: {error:?}"),
     }
