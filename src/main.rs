@@ -233,14 +233,12 @@ async fn finished_command(ctx: PoiseContext<'fut>) {
 
 #[hook]
 async fn dynamic_prefix(
-    ctx: &'fut Context,
+    _: &'fut Context,
     msg: &'fut Message,
-    _: &'fut Data,
+    data: &'fut Data,
 ) -> Result<Option<(&'fut str, &'fut str)>, Error> {
     let prefix = if let Some(ref guild_id) = msg.guild_id {
-        let data = ctx.data.read().await;
-        let settings = data.get::<ServerSettings>().unwrap();
-
+        let settings = data.settings.lock().unwrap();
         let prefix = settings
             .servers
             .get(guild_id)
