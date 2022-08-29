@@ -73,31 +73,22 @@ async fn event_listener(
                 Ok(AttachmentParseSuccess::NothingToDo) => {}
                 Ok(AttachmentParseSuccess::BeingProcessed) => {
                     let reaction = ReactionType::Unicode("✅".to_string());
-                    if let Err(why) = msg.react(&ctx, reaction).await {
-                        let err = Error::new(why)
-                            .context("failed to react after attachment parse success");
-                        warn!("{:?}", err);
-                    }
+                    msg.react(&ctx, reaction)
+                        .await
+                        .context("failed to react after attachment parse success")?;
                 }
                 Err(AttachmentParseError::IncorrectMode(_)) => {
-                    if let Err(why) = msg
-                        .reply(&ctx, "danser only accepts osu!standard plays, sorry :(")
+                    msg.reply(&ctx, "danser only accepts osu!standard plays, sorry :(")
                         .await
-                    {
-                        let err =
-                            Error::new(why).context("failed to reply after attachment parse error");
-                        warn!("{:?}", err);
-                    }
+                        .context("failed to reply after attachment parse error")?;
                 }
                 Err(why) => {
                     let err = Error::new(why).context("failed to parse attachment");
                     warn!("{:?}", err);
 
-                    if let Err(why) = msg.reply(&ctx, "something went wrong, blame mezo").await {
-                        let err =
-                            Error::new(why).context("failed to reply after attachment parse error");
-                        warn!("{:?}", err);
-                    }
+                    msg.reply(&ctx, "something went wrong, blame mezo")
+                        .await
+                        .context("failed to reply after attachment parse error")?;
                 }
             }
         }
@@ -130,7 +121,7 @@ async fn register(ctx: PoiseContext<'_>) -> Result<(), Error> {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Error> {
     dotenv::dotenv().expect("Failed to read .env file");
     logging::initialize().expect("Failed to initialize logging");
 
@@ -180,21 +171,13 @@ async fn main() {
         .await
         .unwrap();
 
-    let osu: Osu = match Osu::new(client_id, client_secret).await {
-        Ok(client) => client,
-        Err(why) => panic!(
-            "{:?}",
-            Error::new(why).context("failed to create osu! client")
-        ),
-    };
+    let osu: Osu = Osu::new(client_id, client_secret)
+        .await
+        .context("failed to create osu! client")?;
 
-    let reqwest_client = match reqwest::Client::builder().build() {
-        Ok(client) => client,
-        Err(why) => panic!(
-            "{:?}",
-            Error::new(why).context("failed to create reqwest client"),
-        ),
-    };
+    let reqwest_client = reqwest::Client::builder()
+        .build()
+        .context("failed to create reqwest client")?;
 
     let http = Arc::clone(&framework.client().cache_and_http.http);
     let queue = Arc::new(ReplayQueue::new());
@@ -205,11 +188,10 @@ async fn main() {
         Arc::clone(&queue),
     ));
 
-    if let Err(why) = framework.start().await {
-        error!("{:?}", Error::new(why).context("critical client error"));
-    }
+    framework.start().await.context("critical client error")?;
 
     info!("Shutting down");
+    Ok(())
 }
 
 async fn create_missing_folders_and_files() -> Result<()> {
